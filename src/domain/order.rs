@@ -1,17 +1,19 @@
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use crate::domain::trade::Trade;
 
 pub struct OrderBook {
     bids: BTreeMap<u64, VecDeque<Order>>,
-    asks: BTreeMap<u64, VecDeque<Order>>
+    asks: BTreeMap<u64, VecDeque<Order>>,
+    order_index : HashMap<u64, (Side, u64)>
 }
 
 impl OrderBook {
     pub fn new() -> Self {
         OrderBook {
             bids: BTreeMap::new(),
-            asks: BTreeMap::new()
+            asks: BTreeMap::new(),
+            order_index: HashMap::new()
         }
     }
     pub fn add_order(&mut self, mut order: Order) -> Vec<Trade> {
@@ -69,8 +71,8 @@ impl OrderBook {
                             let fill_qty = order.quantity.min(resting_order.quantity);
 
                             trades.push(Trade {
-                                sell_order_id: resting_order.id,
-                                buy_order_id: order.id,
+                                buy_order_id: resting_order.id,
+                                sell_order_id: order.id,
                                 price: best_bid_price,
                                 quantity: fill_qty
                             });
@@ -95,6 +97,7 @@ impl OrderBook {
 
         // insert any remaining quantity as resting order
         if order.quantity > 0 {
+            self.order_index.insert(order.id, (order.side, order.price));
             if order.is_buy() {
                 if !self.bids.contains_key(&order.price) {
                     self.bids.insert(order.price, VecDeque::new());
@@ -112,8 +115,26 @@ impl OrderBook {
     }
 
 
-    pub fn cancel_order(&mut self, order_id: u64) {
+    pub fn cancel_order(&mut self, order_id: u64) -> Option<Order> {
+        let (side, price) = self.order_index.get(&order_id)?;
 
+        let book_side = match side{
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks
+        };
+
+        let queue = book_side.get_mut(price)?;
+
+        let index = queue.iter().position(|o| o.id == order_id)?;
+        let order = queue.remove(index)?;
+
+        if queue.is_empty() {
+            book_side.remove(&price);
+        }
+
+        self.order_index.remove(&order_id);
+
+        Some(order)
     }
 
     pub fn best_bid(&self) -> Option<u64> {
@@ -143,7 +164,7 @@ impl Order {
 }
 
 // public enum Side
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Side {
     Buy,
     Sell
@@ -393,6 +414,94 @@ mod tests {
         // Second trade: id:2 partially filled
         assert_eq!(trades[1].sell_order_id, 2);
         assert_eq!(trades[1].quantity, 25);
+    }
+
+    // M3: Cancel order tests
+
+    #[test]
+    fn test_cancel_existing_order() {
+        let mut book = OrderBook::new();
+        book.add_order(Order { id: 1, side: Side::Buy, price: 100, quantity: 10 });
+
+        let result = book.cancel_order(1);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, 1);
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn test_cancel_non_existing_order() {
+        let mut book = OrderBook::new();
+        book.add_order(Order { id: 1, side: Side::Buy, price: 100, quantity: 10 });
+
+        let result = book.cancel_order(999);
+
+        assert!(result.is_none());
+        // Original order should still be there
+        assert_eq!(book.best_bid(), Some(100));
+    }
+
+    #[test]
+    fn test_cancel_best_bid() {
+        let mut book = OrderBook::new();
+        book.add_order(Order { id: 1, side: Side::Buy, price: 100, quantity: 10 });
+        book.add_order(Order { id: 2, side: Side::Buy, price: 105, quantity: 10 });
+        book.add_order(Order { id: 3, side: Side::Buy, price: 102, quantity: 10 });
+
+        // Cancel the best bid (105)
+        let result = book.cancel_order(2);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().price, 105);
+        // Next best should be 102
+        assert_eq!(book.best_bid(), Some(102));
+    }
+
+    #[test]
+    fn test_cancel_mid_level() {
+        let mut book = OrderBook::new();
+        // Three orders at the same price (FIFO queue)
+        book.add_order(Order { id: 1, side: Side::Sell, price: 50, quantity: 10 });
+        book.add_order(Order { id: 2, side: Side::Sell, price: 50, quantity: 20 });
+        book.add_order(Order { id: 3, side: Side::Sell, price: 50, quantity: 30 });
+
+        // Cancel the middle one
+        let result = book.cancel_order(2);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().quantity, 20);
+
+        // Buy 40 - should match id:1 (10) then id:3 (30)
+        let trades = book.add_order(Order { id: 4, side: Side::Buy, price: 50, quantity: 40 });
+
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[0].sell_order_id, 1);
+        assert_eq!(trades[0].quantity, 10);
+        assert_eq!(trades[1].sell_order_id, 3);
+        assert_eq!(trades[1].quantity, 30);
+    }
+
+    #[test]
+    fn test_book_state_consistent_after_cancel() {
+        let mut book = OrderBook::new();
+        // Set up book with bids and asks
+        book.add_order(Order { id: 1, side: Side::Buy, price: 100, quantity: 50 });
+        book.add_order(Order { id: 2, side: Side::Sell, price: 110, quantity: 50 });
+
+        // Cancel the bid
+        book.cancel_order(1);
+
+        // Add a new bid and verify it works
+        book.add_order(Order { id: 3, side: Side::Buy, price: 105, quantity: 25 });
+        assert_eq!(book.best_bid(), Some(105));
+
+        // Matching should still work - sell into the new bid
+        let trades = book.add_order(Order { id: 4, side: Side::Sell, price: 105, quantity: 25 });
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].buy_order_id, 3);
+        assert_eq!(trades[0].quantity, 25);
     }
 
 }
