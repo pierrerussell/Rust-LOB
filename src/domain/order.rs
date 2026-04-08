@@ -2,10 +2,11 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use crate::domain::trade::Trade;
 
+#[derive(Debug)]
 pub struct OrderBook {
     bids: BTreeMap<u64, VecDeque<Order>>,
     asks: BTreeMap<u64, VecDeque<Order>>,
-    order_index : HashMap<u64, (Side, u64)>
+    order_index: HashMap<u64, (Side, u64)>,
 }
 
 impl OrderBook {
